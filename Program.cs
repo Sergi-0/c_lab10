@@ -1,16 +1,13 @@
 using System;
-using System.IO;
 using System.Net.Http;
 using System.Threading.Tasks;
-using System.Linq;
-using Newtonsoft.Json;
+using System.Collections.Generic;
 using Microsoft.EntityFrameworkCore;
-using System.ComponentModel.DataAnnotations;
-using System.ComponentModel.DataAnnotations.Schema;
+using Newtonsoft.Json;
+using System.Runtime.Remoting.Contexts;
 
 public class Stock
 {
-    [Key]
     public int Id { get; set; }
     public string Ticker { get; set; }
     public decimal HighPrice { get; set; }
@@ -18,16 +15,66 @@ public class Stock
     public DateTime Date { get; set; }
 }
 
-public class TodaysCondition
+public class StockCondition
 {
-    [Key]
     public int Id { get; set; }
     public string Ticker { get; set; }
     public decimal PreviousPrice { get; set; }
     public decimal CurrentPrice { get; set; }
-    [Column("PriceChangeStatus")]
-    public string PriceChange { get; set; }
-    public DateTime Date { get; set; }
+    public string Status { get; set; }
+    public DateTime AnalysisDate { get; set; }
+}
+
+public class StockDbContext : DbContext
+{
+    public DbSet<Stock> Stocks { get; set; }
+    public DbSet<StockCondition> StockConditions { get; set; }
+
+    protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
+    {
+        optionsBuilder.UseSqlServer("Server=localhost,1433;Database=StockDB;User Id=SA;Password=StrongPassword123!;TrustServerCertificate=True;");
+    }
+}
+
+public class StockDataLoader
+{
+    private static readonly string API_KEY = "OGdjYU5YZElRQkg0QVNOZDRiRUN4YWtOb2JNNkZReGMzd1BBeDBLc1pEST0";
+    private static readonly HttpClient client = new HttpClient();
+
+    public async Task<StockDataResponse> GetStockData(string ticker)
+    {
+        try
+        {
+            string url = $"https://api.marketdata.app/v1/stocks/candles/D/{ticker}/";
+            var request = new HttpRequestMessage(HttpMethod.Get, url);
+            request.Headers.Add("Authorization", $"Bearer {API_KEY}");
+            var response = await client.SendAsync(request);
+
+            var jsonResponse = await response.Content.ReadAsStringAsync();
+            return JsonConvert.DeserializeObject<StockDataResponse>(jsonResponse);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка загрузки данных: {ex.Message}");
+            return null;
+        }
+    }
+}
+
+public class StockAnalyzer
+{
+    public StockCondition AnalyzeStock(string ticker, decimal currentPrice, decimal previousPrice)
+    {
+        return new StockCondition
+        {
+            Ticker = ticker,
+            PreviousPrice = previousPrice,
+            CurrentPrice = currentPrice,
+            Status = currentPrice > previousPrice ? "Выросла" :
+                     currentPrice < previousPrice ? "Упала" : "Без изменений",
+            AnalysisDate = DateTime.Now
+        };
+    }
 }
 
 public class StockDataResponse
@@ -40,129 +87,58 @@ public class StockDataResponse
 
     [JsonProperty("l")]
     public double[] Low { get; set; }
-
-    [JsonProperty("t")]
-    public long[] Timestamps { get; set; }
-}
-
-public class StockContext : DbContext
-{
-    public DbSet<Stock> Stocks { get; set; }
-    public DbSet<TodaysCondition> TodaysConditions { get; set; }
-
-    protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
-    {
-        optionsBuilder.UseSqlServer(@"Server=localhost,1433;Database=StockPriceDB;User Id=SA;Password=YourStrong!Passw0rd;TrustServerCertificate=True;");
-    }
 }
 
 class Program
 {
-    private static readonly string API_KEY = "OGdjYU5YZElRQkg0QVNOZDRiRUN4YWtOb2JNNkZReGMzd1BBeDBLc1pEST0";
-    private static readonly HttpClient client = new HttpClient();
-
-    static async Task Main(string[] args)
+    static async Task Main()
     {
-        using (var context = new StockContext())
+        var loader = new StockDataLoader();
+        var analyzer = new StockAnalyzer();
+        var context = new StockDbContext();
+
+        Console.WriteLine("Введите тикер акции:");
+        string ticker = Console.ReadLine().ToUpper();
+
+        var stockData = await loader.GetStockData(ticker);
+
+        if (stockData?.Status == "ok" && stockData.High?.Length > 0 && stockData.Low?.Length > 0)
         {
-            await context.Database.MigrateAsync();
-
-            string[] tickers = File.ReadAllLines("ticker.txt");
-            var toDate = DateTime.Now;
-            var fromDate = toDate.AddYears(-1);
-
-            foreach (var ticker in tickers)
-            {
-                await ProcessTickerAsync(context, ticker, fromDate, toDate);
-                await Task.Delay(1000);
-            }
-
-            await AnalyzeStockPricesAsync(context);
-
-            while (true)
-            {
-                Console.Write("Введите тикер акции (или 'exit' для выхода): ");
-                string ticker = Console.ReadLine().ToUpper();
-
-                if (ticker == "EXIT") break;
-
-                string condition = await GetStockConditionAsync(context, ticker);
-                Console.WriteLine(condition);
-            }
-        }
-    }
-
-    static async Task ProcessTickerAsync(StockContext context, string ticker, DateTime fromDate, DateTime toDate)
-    {
-        string url = $"https://api.marketdata.app/v1/stocks/candles/D/{ticker}/?from={fromDate:yyyy-MM-dd}&to={toDate:yyyy-MM-dd}";
-        var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.Add("Authorization", $"Bearer {API_KEY}");
-        
-        var response = await client.SendAsync(request);
-        var jsonResponse = await response.Content.ReadAsStringAsync();
-        var data = JsonConvert.DeserializeObject<StockDataResponse>(jsonResponse);
-
-        for (int i = 0; i < data.High.Length; i++)
-        {
-            var date = DateTimeOffset.FromUnixTimeSeconds(data.Timestamps[i]).DateTime;
+            // Сохраняем данные оstock
             var stock = new Stock
             {
                 Ticker = ticker,
-                HighPrice = (decimal)data.High[i],
-                LowPrice = (decimal)data.Low[i],
-                Date = date
-            };
-
-            context.Stocks.Add(stock);
-        }
-
-        await context.SaveChangesAsync();
-        Console.WriteLine($"Обработан тикер {ticker}: сохранено {data.High.Length} записей");
-    }
-
-    static async Task AnalyzeStockPricesAsync(StockContext context)
-    {
-        var tickers = await context.Stocks.Select(s => s.Ticker).Distinct().ToListAsync();
-
-        foreach (var ticker in tickers)
-        {
-            var stockPrices = await context.Stocks
-                .Where(s => s.Ticker == ticker)
-                .OrderBy(s => s.Date)
-                .ToListAsync();
-
-            var previousStock = stockPrices[stockPrices.Count - 2];
-            var currentStock = stockPrices[stockPrices.Count - 1];
-
-            var previousPrice = (previousStock.HighPrice + previousStock.LowPrice) / 2;
-            var currentPrice = (currentStock.HighPrice + currentStock.LowPrice) / 2;
-
-            var condition = new TodaysCondition
-            {
-                Ticker = ticker,
-                PreviousPrice = previousPrice,
-                CurrentPrice = currentPrice,
-                PriceChange = currentPrice > previousPrice ? "Выросла" : "Упала",
+                HighPrice = (decimal)stockData.High[^1],
+                LowPrice = (decimal)stockData.Low[^1],
                 Date = DateTime.Now
             };
+            context.Stocks.Add(stock);
 
-            context.TodaysConditions.Add(condition);
+            // Получаем предыдущую цену
+            var previousStock = context.Stocks
+                .Where(s => s.Ticker == ticker)
+                .OrderByDescending(s => s.Date)
+                .Skip(1)
+                .FirstOrDefault();
+
+            decimal previousPrice = previousStock?.HighPrice ?? 0;
+            decimal currentPrice = stock.HighPrice;
+
+            // Анализируем изменение цены
+            var condition = analyzer.AnalyzeStock(ticker, currentPrice, previousPrice);
+            context.StockConditions.Add(condition);
+
+            // Сохраняем изменения
+            context.SaveChanges();
+
+            // Выводим результат
+            Console.WriteLine($"Акция {ticker}: {condition.Status}");
+            Console.WriteLine($"Текущая цена: {currentPrice}");
+            Console.WriteLine($"Предыдущая цена: {previousPrice}");
         }
-
-        await context.SaveChangesAsync();
-    }
-
-    static async Task<string> GetStockConditionAsync(StockContext context, string ticker)
-    {
-        var condition = await context.TodaysConditions
-            .Where(c => c.Ticker == ticker)
-            .OrderByDescending(c => c.Date)
-            .FirstOrDefaultAsync();
-
-        return condition != null 
-            ? $"Акция {ticker}: {condition.PriceChange} " +
-              $"(Текущая цена: {condition.CurrentPrice:F2}, " +
-              $"Предыдущая цена: {condition.PreviousPrice:F2})" 
-            : "Данные для акции не найдены";
+        else
+        {
+            Console.WriteLine("Не удалось получить данные о акции.");
+        }
     }
 }
